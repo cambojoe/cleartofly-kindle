@@ -48,6 +48,18 @@ jobs:
       - name: Veröffentlichungsdateien prüfen
         run: test -s public/current.png && test -s public/index.html
 
+      - name: Wetterseite zu InfinityFree übertragen
+        uses: SamKirkland/FTP-Deploy-Action@v4.4.0
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          port: 21
+          protocol: ftp
+          local-dir: public/
+          server-dir: /htdocs/
+          dry-run: false
+
       - name: Website-Dateien bereitstellen
         uses: actions/upload-pages-artifact@v3
         with:
