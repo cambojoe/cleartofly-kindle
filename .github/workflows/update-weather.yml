@@ -1,0 +1,58 @@
+name: ClearToFly Alsfeld – Kindle-Anzeige
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Alle 15 Minuten, bewusst nicht zur vollen Stunde (GitHub-Zeitplan in UTC).
+    - cron: '7,22,37,52 * * * *'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: kindle-weather-pages
+  cancel-in-progress: true
+
+jobs:
+  capture-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Repository laden
+        uses: actions/checkout@v4
+
+      - name: Node.js einrichten
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Chromium installieren
+        run: |
+          npm init -y
+          npm install --no-audit --no-fund playwright
+          npx playwright install --with-deps chromium
+
+      - name: ClearToFly aufrufen und Bildschirm erfassen
+        run: node scripts/capture.mjs
+
+      - name: Schwarz-Weiß-Bild und Kindle-Seite erzeugen
+        run: |
+          python -m pip install --quiet Pillow
+          python scripts/make_kindle_image.py
+
+      - name: Veröffentlichungsdateien prüfen
+        run: test -s public/current.png && test -s public/index.html
+
+      - name: Website-Dateien bereitstellen
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: GitHub Pages veröffentlichen
+        id: deployment
+        uses: actions/deploy-pages@v4
