@@ -1,6 +1,9 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs';
 
+const WIDTH = 600;
+const VIEWPORT_HEIGHT = 1200;
+
 function berlinDate(offsetDays = 0) {
   const parts = new Intl.DateTimeFormat('en-GB', {
     timeZone: 'Europe/Berlin',
@@ -14,64 +17,140 @@ function berlinDate(offsetDays = 0) {
   return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(date.getUTCDate()).padStart(2, '0')}`;
 }
 
-const browser = await chromium.launch({ headless: true });
-const layouts = [
-  { name: 'portrait', width: 600, height: 1200 },
-  { name: 'landscape', width: 800, height: 1100 }
-];
-
-try {
-  for (const layout of layouts) {
-    const page = await browser.newPage({
-      viewport: { width: layout.width, height: layout.height },
-      deviceScaleFactor: 1,
-      locale: 'de-DE',
-      timezoneId: 'Europe/Berlin',
-      colorScheme: 'light'
-    });
-    page.setDefaultTimeout(15000);
-
-    for (let day = 0; day < 3; day += 1) {
-      const date = berlinDate(day);
-      const targetUrl = `https://cleartofly.de/airfield/DE-ALSFELD?date=${date}`;
-      console.log(`Erfasse ${layout.name}, Tag ${day + 1}/3: ${targetUrl}`);
-
-      const response = await page.goto(targetUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: 90000
-      });
-      if (!response) throw new Error(`Keine HTTP-Antwort für ${targetUrl}`);
-      if (response.status() >= 400) {
-        throw new Error(`ClearToFly antwortet für ${date} mit HTTP ${response.status()}.`);
+// Find the visible chart heading by its short text. ClearToFly currently labels
+// its panels in English; the alternate names make the workflow more tolerant
+// of small wording changes.
+async function findHeadingY(page, label, aliases, required = true) {
+  const result = await page.evaluate((requestedAliases) => {
+    const norm = (value) => String(value || '')
+      .replace(/\s+/g, ' ')
+      .replace(/[：:]$/, '')
+      .trim()
+      .toLowerCase();
+    const wanted = requestedAliases.map(norm);
+    const candidates = [];
+    for (const el of document.querySelectorAll('body *')) {
+      const raw = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!raw || raw.length > 42) continue;
+      const text = norm(raw);
+      let matchRank = 999;
+      for (let i = 0; i < wanted.length; i += 1) {
+        const term = wanted[i];
+        if (text === term) matchRank = Math.min(matchRank, i);
+        else if (text.startsWith(term + ' ') || text.startsWith(term + ':')) {
+          matchRank = Math.min(matchRank, 100 + i);
+        }
       }
-
-      await page.locator('body').waitFor({ state: 'visible' });
-      // ClearToFly draws its charts client-side; allow them to finish.
-      await page.waitForTimeout(12000);
-
-      const finalUrl = page.url();
-      const title = await page.title().catch(() => '');
-      const bodyText = await page.locator('body').innerText().catch(() => '');
-      console.log(`Seite: ${title}; Textlänge: ${bodyText.length}; URL: ${finalUrl}`);
-
-      if (!finalUrl.includes('cleartofly.de')) {
-        throw new Error(`Weiterleitung weg von ClearToFly: ${finalUrl}`);
-      }
-      if (bodyText.length < 80 || !/(Alsfeld|ClearToFly|Wind|Wolken|Flugwetter|Sicht)/i.test(bodyText)) {
-        throw new Error(`Wetterdarstellung für ${date} wurde nicht erkannt. Kein Fehlerbild wird veröffentlicht.`);
-      }
-
-      await page.screenshot({
-        path: `/tmp/cleartofly-${layout.name}-day-${day}-raw.png`,
-        animations: 'disabled'
-      });
-      fs.writeFileSync(
-        `/tmp/cleartofly-${layout.name}-day-${day}-info.txt`,
-        `${targetUrl}\n${title}\n${date}\n${layout.width}x${layout.height}\n`
-      );
+      if (matchRank === 999) continue;
+      const rect = el.getBoundingClientRect();
+      const documentY = rect.top + window.scrollY;
+      if (rect.width < 8 || rect.height < 5 || rect.height > 100 || documentY < 130) continue;
+      if (el.children.length > 5) continue;
+      const headingTag = /^H[1-6]$/.test(el.tagName) || el.tagName === 'SUMMARY' || el.tagName === 'BUTTON';
+      const rank = matchRank * 100 + (headingTag ? 0 : 4) + (el.children.length === 0 ? 0 : 2) + Math.min(raw.length, 40) / 100;
+      candidates.push({ text: raw, y: documentY, rank, tag: el.tagName });
     }
-    await page.close();
+    candidates.sort((a, b) => a.rank - b.rank || a.y - b.y);
+    return candidates.length ? candidates[0] : null;
+  }, aliases);
+
+  if (!result) {
+    const message = `ClearToFly-Überschrift für „${label}“ nicht gefunden (gesucht: ${aliases.join(', ')}).`;
+    if (required) throw new Error(message);
+    console.warn(message);
+    return null;
   }
+  console.log(`Diagramm „${label}“ gefunden: ${result.text} bei Y=${Math.round(result.y)} px (${result.tag}).`);
+  return result.y;
+}
+
+async function scrollToChart(page, documentY) {
+  const targetScrollY = Math.max(0, Math.round(documentY - 45));
+  await page.evaluate((y) => window.scrollTo(0, y), targetScrollY);
+  await page.waitForTimeout(500);
+  return await page.evaluate(() => window.scrollY);
+}
+
+async function captureGroup(page, { path, startY, stopY, fallbackHeight, title }) {
+  const scrollY = await scrollToChart(page, startY);
+  // Stop just before the next chart, so that the bottom of one page does not
+  // show a clipped fragment of the next page's first chart.
+  let clipHeight = stopY ? Math.floor(stopY - scrollY - 8) : fallbackHeight;
+  clipHeight = Math.min(740, Math.max(420, clipHeight || fallbackHeight));
+  if (clipHeight > VIEWPORT_HEIGHT) clipHeight = VIEWPORT_HEIGHT;
+  console.log(`${title}: Bildausschnitt 600x${clipHeight}, Scrollposition ${Math.round(scrollY)} px.`);
+  await page.screenshot({
+    path,
+    clip: { x: 0, y: 0, width: WIDTH, height: clipHeight },
+    animations: 'disabled'
+  });
+}
+
+const browser = await chromium.launch({ headless: true });
+try {
+  const page = await browser.newPage({
+    viewport: { width: WIDTH, height: VIEWPORT_HEIGHT },
+    deviceScaleFactor: 1,
+    locale: 'de-DE',
+    timezoneId: 'Europe/Berlin',
+    colorScheme: 'light'
+  });
+  page.setDefaultTimeout(15000);
+
+  for (let day = 0; day < 3; day += 1) {
+    const date = berlinDate(day);
+    const targetUrl = `https://cleartofly.de/airfield/DE-ALSFELD?date=${date}`;
+    console.log(`\nErfasse ClearToFly für Tag ${day + 1}/3: ${targetUrl}`);
+    const response = await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    if (!response) throw new Error(`Keine HTTP-Antwort für ${targetUrl}`);
+    if (response.status() >= 400) throw new Error(`ClearToFly antwortet für ${date} mit HTTP ${response.status()}.`);
+    await page.locator('body').waitFor({ state: 'visible' });
+    // Give the client-side charts time to finish drawing.
+    await page.waitForTimeout(12000);
+
+    const finalUrl = page.url();
+    const bodyText = await page.locator('body').innerText().catch(() => '');
+    console.log(`Endadresse: ${finalUrl}; Textlänge: ${bodyText.length}`);
+    if (!finalUrl.includes('cleartofly.de')) throw new Error(`Unerwartete Weiterleitung: ${finalUrl}`);
+    if (bodyText.length < 80 || !/(Alsfeld|Wind|Cloud|Wolken|Visibility|Sicht)/i.test(bodyText)) {
+      throw new Error('Die Wetterdarstellung wurde nicht erkannt. Es wird kein leeres/Fehlerbild veröffentlicht.');
+    }
+
+    const temperatureY = await findHeadingY(page, 'Temperatur', ['Temperature', 'Temp']);
+    const windY = await findHeadingY(page, 'Wind', ['Wind']);
+    const crosswindY = await findHeadingY(page, 'Querwind', ['Crosswind component', 'Crosswind', 'Cross wind', 'Cross-wind']);
+    const cloudsY = await findHeadingY(page, 'Wolkenbedeckung', ['Cloud cover', 'Cloud coverage', 'Clouds by altitude', 'Cloudiness', 'Clouds']);
+    const visibilityY = await findHeadingY(page, 'Sichtweite', ['Visibility']);
+    const runwayY = await findHeadingY(page, 'Pistenwind', [
+      'Runway wind', 'Wind component to runway', 'Wind components to runway',
+      'Runway component', 'Headwind / tailwind', 'Headwind', 'Tailwind'
+    ]);
+
+    if (!(temperatureY < windY && windY < crosswindY && crosswindY < cloudsY && cloudsY < visibilityY && visibilityY < runwayY)) {
+      throw new Error('Die Reihenfolge der ClearToFly-Diagramme hat sich geändert. Die Bilder wurden nicht veröffentlicht, damit keine falschen Bereiche angezeigt werden.');
+    }
+
+    fs.mkdirSync('public', { recursive: true });
+    await captureGroup(page, {
+      path: `/tmp/cleartofly-day-${day}-page-0-raw.png`,
+      startY: temperatureY,
+      stopY: cloudsY,
+      fallbackHeight: 700,
+      title: `Tag ${day + 1}, Seite 1 (Temperatur/Wind/Querwind)`
+    });
+    await captureGroup(page, {
+      path: `/tmp/cleartofly-day-${day}-page-1-raw.png`,
+      startY: cloudsY,
+      // The three requested panels are each roughly one plot-height. Use a
+      // following precipitation/pressure panel as a boundary if detected;
+      // otherwise stop after the runway-wind panel rather than clipping it.
+      stopY: runwayY + 205,
+      fallbackHeight: 700,
+      title: `Tag ${day + 1}, Seite 2 (Wolken/Sicht/Pistenwind)`
+    });
+    fs.writeFileSync(`/tmp/cleartofly-day-${day}-info.txt`, `${targetUrl}\n${date}\n`);
+  }
+  await page.close();
 } finally {
   await browser.close();
 }
