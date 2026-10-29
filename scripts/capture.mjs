@@ -76,7 +76,10 @@ async function captureGroup(page, { path, startY, stopY, fallbackHeight, title }
   // Stop just before the next chart, so that the bottom of one page does not
   // show a clipped fragment of the next page's first chart.
   let clipHeight = stopY ? Math.floor(stopY - scrollY - 8) : fallbackHeight;
-  clipHeight = Math.min(740, Math.max(420, clipHeight || fallbackHeight));
+  // Some ClearToFly panels are taller than the Kindle's available content
+  // area. Capture up to 900 px here; make_kindle_image.py scales the full
+  // stack down to the 740 px content height instead of cropping a chart.
+  clipHeight = Math.min(900, Math.max(420, clipHeight || fallbackHeight));
   if (clipHeight > VIEWPORT_HEIGHT) clipHeight = VIEWPORT_HEIGHT;
   console.log(`${title}: Bildausschnitt 600x${clipHeight}, Scrollposition ${Math.round(scrollY)} px.`);
   await page.screenshot({
@@ -126,8 +129,11 @@ try {
       'Runway component', 'Headwind / tailwind', 'Headwind', 'Tailwind'
     ]);
 
-    if (!(temperatureY < windY && windY < crosswindY && crosswindY < cloudsY && cloudsY < visibilityY && visibilityY < runwayY)) {
-      throw new Error('Die Reihenfolge der ClearToFly-Diagramme hat sich geändert. Die Bilder wurden nicht veröffentlicht, damit keine falschen Bereiche angezeigt werden.');
+    // ClearToFly's actual order can place the runway-wind accordion before
+    // Cloud Cover and Visibility. Validate the order within each page, rather
+    // than incorrectly expecting all six panels in a single fixed sequence.
+    if (!(temperatureY < windY && windY < crosswindY && runwayY < cloudsY && cloudsY < visibilityY)) {
+      throw new Error('Die Reihenfolge der ClearToFly-Diagramme passt nicht zu den zwei vorgesehenen Seiten. Die Bilder wurden nicht veröffentlicht, damit keine falschen Bereiche angezeigt werden.');
     }
 
     fs.mkdirSync('public', { recursive: true });
@@ -140,12 +146,13 @@ try {
     });
     await captureGroup(page, {
       path: `/tmp/cleartofly-day-${day}-page-1-raw.png`,
-      startY: cloudsY,
-      // The three requested panels are each roughly one plot-height. Use a
-      // following precipitation/pressure panel as a boundary if detected;
-      // otherwise stop after the runway-wind panel rather than clipping it.
-      stopY: runwayY + 205,
-      fallbackHeight: 700,
+      // In the live Alsfeld layout the Runway wind panel appears before
+      // Cloud Cover and Visibility, so begin at the earliest of those three.
+      // Include the full Visibility plot and let the image step scale the
+      // complete vertical stack to the Kindle content height.
+      startY: runwayY,
+      stopY: visibilityY + 225,
+      fallbackHeight: 800,
       title: `Tag ${day + 1}, Seite 2 (Wolken/Sicht/Pistenwind)`
     });
     fs.writeFileSync(`/tmp/cleartofly-day-${day}-info.txt`, `${targetUrl}\n${date}\n`);

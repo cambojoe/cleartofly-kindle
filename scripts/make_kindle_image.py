@@ -55,7 +55,9 @@ def make_image(day, page):
             raise SystemExit(f"Unerwartete Bildbreite für Tag {day + 1}, Seite {page + 1}: {source.width}; erwartet {WIDTH}.")
         image = source.convert("L")
         if image.height > CONTENT_HEIGHT:
-            image = image.crop((0, 0, WIDTH, CONTENT_HEIGHT))
+            # Preserve the complete chart stack (especially Visibility at the
+            # bottom of page 2) instead of cropping off its lower edge.
+            image = image.resize((WIDTH, CONTENT_HEIGHT), Image.Resampling.LANCZOS)
         image = ImageOps.autocontrast(image, cutoff=0.4)
         image = ImageEnhance.Contrast(image).enhance(1.10)
 
